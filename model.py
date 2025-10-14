@@ -1,118 +1,99 @@
+from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader
 from langchain.prompts import PromptTemplate
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.llms import CTransformers
 from langchain.chains import RetrievalQA
 import chainlit as cl
-import time
 
-# =====================================================
-# CONFIG
-# =====================================================
-DB_FAISS_PATH = "vectorstores/db_faiss"
-LLAMA_MODEL_PATH = "./llama-2-7b-chat.ggmlv3.q8_0.bin"
+DB_FAISS_PATH = 'vectorstores/db_faiss'
 
-custom_prompt_template = """Use the following context to answer the user's question.
-If you don't know the answer, just say you don't know. Do not make up an answer.
+custom_prompt_template = """ Use the following pieces of information to answer the user's question.
+If you don't know the answer, just say that you don't know, don't try to make up an answer.
 
-Context:
-{context}
+Context: {context}
+Question: {question}        
 
-Question:
-{query}
+Only return the helpful answer below and nothing else.
+Helpful answer:
 
-Helpful Answer:
 """
 
-
 def set_custom_prompt():
-    """Return custom prompt template for RetrievalQA."""
-    return PromptTemplate(
-        template=custom_prompt_template,
-        input_variables=["context", "query"],
-    )
+    """
+    Prompt template for QA retrieval for each vectorstore
+    """
+    prompt = PromptTemplate(template=custom_prompt_template,
+                            input_variables=['context', 'question'])
+    return prompt
 
+#Retrieval QA Chain
+def retrieval_qa_chain(llm, prompt, db):
+    qa_chain = RetrievalQA.from_chain_type(llm=llm,
+                                       chain_type='stuff',
+                                       retriever=db.as_retriever(search_kwargs={'k': 2}),
+                                       return_source_documents=True,
+                                       chain_type_kwargs={'prompt': prompt}
+                                       )
+    return qa_chain
 
 def load_llm():
-    """Load the local LLaMA model using CTransformers."""
-    return CTransformers(
-        model=LLAMA_MODEL_PATH,
+    llm = CTransformers(
+        model = "llama-2-7b-chat.ggmlv3.q8_0.bin",
         model_type="llama",
-        max_new_tokens=512,
-        temperature=0.5,
+        max_new_tokens = 512,
+        temperature = 0.5
     )
-
+    return llm
 
 def qa_bot():
-    """Initialize QA chain with FAISS and LLM."""
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "cpu"},
-    )
-
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2",
+                                       model_kwargs={'device': 'cpu'})
     db = FAISS.load_local(DB_FAISS_PATH, embeddings, allow_dangerous_deserialization=True)
     llm = load_llm()
-    prompt = set_custom_prompt()
-
-    qa = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=db.as_retriever(search_kwargs={"k": 2}),
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": prompt},
-    )
+    qa_prompt = set_custom_prompt()
+    qa = retrieval_qa_chain(llm, qa_prompt, db)
 
     return qa
 
-
 def final_result(query):
-    """Run a one-off query without Chainlit."""
-    qa = qa_bot()
-    response = qa({"query": query})
+    qa_result = qa_bot()
+    response = qa_result({'query': query})
     return response
 
-
-# =====================================================
-# CHAINLIT APP
-# =====================================================
+#chainlit code
 @cl.on_chat_start
 async def start():
-    """Initialize chatbot session."""
-    time.sleep(10)
-    msg = cl.Message(content="Starting the Medical Assistant bot...")
+    chain = qa_bot()
+    msg = cl.Message(content="Starting the bot...")
     await msg.send()
+    msg.content = "Hi! I'm your Medical Assistant. How can I Assist you today?"
+    await msg.update()
 
-    try:
-        chain = qa_bot()
-        msg.content = "👋 Hi! I'm your Medical Assistant. How can I help you today?"
-        await msg.update()
-        cl.user_session.set("chain", chain)
-    except Exception as e:
-        msg.content = f"❌ Error initializing bot: {str(e)}\nPlease run 'python ingest.py' first."
-        await msg.update()
-
+    cl.user_session.set("chain", chain)
 
 @cl.on_message
 async def main(message: cl.Message):
-    """Handle user messages."""
     chain = cl.user_session.get("chain")
-    if chain is None:
-        await cl.Message("Bot not initialized. Please refresh the page.").send()
-        return
+    cb = cl.AsyncLangchainCallbackHandler(
+        stream_final_answer=True, answer_prefix_tokens=["FINAL", "ANSWER"]
+    )
+    cb.answer_reached = True
+    res = await chain.ainvoke(message.content, callbacks=[cb])
 
-    try:
-        res = await chain.ainvoke(message.content)
-        answer = res["result"]
-        sources = res.get("source_documents", [])
+    answer = res["result"]
 
-        if sources:
-            answer += "\n\n📚 **Sources:**"
-            for i, doc in enumerate(sources, 1):
-                src = doc.metadata.get("source", "Unknown")
-                pg = doc.metadata.get("page", "N/A")
-                answer += f"\n{i}. {src} (Page {pg})"
+    sources = res["source_documents"]
+    formatted_sources = []
+    if sources:
+        for doc in sources:
+            source_name = doc.metadata.get("source", "Unknown Source").split("\\")[-1]  
+            formatted_sources.append(source_name)
 
-        await cl.Message(content=answer).send()
+    response_content = f"**Answer:**\n\n{answer}\n\n**Sources:**\n\n"
+    if formatted_sources:
+        response_content += "\n".join(f"- {source}" for source in formatted_sources)
+    else:
+        response_content += "No sources found."
 
-    except Exception as e:
-        await cl.Message(content=f"⚠️ Error: {str(e)}").send()
+    await cl.Message(content=response_content).send()
