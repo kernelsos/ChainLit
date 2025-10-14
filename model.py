@@ -4,6 +4,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.llms import CTransformers
 from langchain.chains import RetrievalQA
 import chainlit as cl
+import time
 
 # =====================================================
 # CONFIG
@@ -77,6 +78,7 @@ def final_result(query):
 @cl.on_chat_start
 async def start():
     """Initialize chatbot session."""
+    time.sleep(10)
     msg = cl.Message(content="Starting the Medical Assistant bot...")
     await msg.send()
 
